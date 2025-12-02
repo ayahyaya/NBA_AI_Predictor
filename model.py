@@ -346,6 +346,34 @@ def add_over_under_probabilities(
 
     return df
 
+def apply_usage_bump(out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply a usage bump to players when a starter is out.
+    Very strong effect in real NBA games.
+
+    Typical on/off bumps:
+      - Points: +5% to +12%
+      - Assists: +3% to +8%
+      - Rebounds: +2% to +7%
+
+    We'll use:
+      pts: +8%
+      ast: +5%
+      trb: +6%
+    """
+
+    out = out.copy()
+
+    if "final_pts" in out.columns:
+        out["final_pts"] *= 1.08   # +8%
+
+    if "final_ast" in out.columns:
+        out["final_ast"] *= 1.05   # +5%
+
+    if "final_trb" in out.columns:
+        out["final_trb"] *= 1.06   # +6%
+
+    return out
 
 def predict_replacement_stats(
     master_df: pd.DataFrame,
@@ -379,11 +407,12 @@ def predict_replacement_stats(
         model = models[k]
         per_min_pred = model.predict(X_feat)  # stat per minute
         out[f"final_{k}"] = per_min_pred * base["predicted_new_minutes"]
+        # Apply usage bump after raw model predictions
+    out = apply_usage_bump(out)
 
     # Sort by minutes (most important replacements first)
     out = out.sort_values("predicted_new_minutes", ascending=False).reset_index(drop=True)
     return out
-
 
 # =====================================================
 # PUBLIC ENTRY POINT (USED BY DISCORD BOT)
