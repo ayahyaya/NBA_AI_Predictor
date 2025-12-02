@@ -429,8 +429,17 @@ def _init_if_needed():
     if MASTER_DF is not None and MODELS:
         return
 
-    MASTER_DF = merge_all()
+    df = merge_all()
+
+    # 🔥 FILTER TO ONLY RECENT SEASONS (2025 + 2026)
+    recent_df = df[df["season"].isin([2025, 2026])]
+    print("Training on seasons:", sorted(recent_df["season"].unique()))
+    print("Recent dataset size:", recent_df.shape)
+
+    MASTER_DF = recent_df
+
     MODELS, ERROR_STD = train_ml_models(MASTER_DF)
+
 
 
 def run_prediction(
