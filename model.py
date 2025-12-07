@@ -1,3 +1,14 @@
+"""
+NBA Predictor model.py
+v1.5 - Opponent-aware, supports accented names like Luka Dončić.
+
+Requires CSVs (exact names, inside folder "NBA CSV's"):
+- Player Per Game.csv
+- Player Play By Play.csv
+- Team Abbrev.csv
+- Opponent Stats Per Game.csv
+"""
+
 import numpy as np
 import math
 from pathlib import Path
@@ -7,7 +18,6 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
-
 
 # =====================================================
 # CONFIG
@@ -42,7 +52,7 @@ ML_FEATURE_COLS = [
     "orb_per_game",
     "drb_per_game",
 
-    # Opponent difficulty (NEW!)
+    # Team-level opponent difficulty (season aggregate)
     "opp_pts_per_game",
     "opp_ast_per_game",
     "opp_trb_per_game",
@@ -50,6 +60,9 @@ ML_FEATURE_COLS = [
     "opp_blk_per_game",
 ]
 
+# Lazy-loaded opponent stats for per-opponent difficulty tweak
+OPP_STATS_DF: Optional[pd.DataFrame] = None
+OPP_LEAGUE_MEANS: Dict[str, float] = {}
 
 # =====================================================
 # BASIC HELPERS
@@ -65,12 +78,25 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def clean_player_name(name: str) -> str:
+    """Normalize player names so 'Luka Dončić' == 'luka doncic'."""
     if not isinstance(name, str):
         return ""
     return (
         name.lower()
         .replace("ö", "o")
         .replace("ó", "o")
+        .replace("ò", "o")
+        .replace("ô", "o")
+        .replace("é", "e")
+        .replace("è", "e")
+        .replace("á", "a")
+        .replace("à", "a")
+        .replace("í", "i")
+        .replace("ç", "c")
+        .replace("č", "c")
+        .replace("ć", "c")
+        .replace("š", "s")
+        .replace("ž", "z")
         .replace(".", "")
         .replace(",", "")
         .strip()
@@ -81,9 +107,77 @@ def add_clean_names(df: pd.DataFrame) -> pd.DataFrame:
     df["player_clean"] = df["player"].apply(clean_player_name)
     return df
 
+# =====================================================
+# OPPONENT DIFFICULTY HELPERS (OPTION C)
+# =====================================================
+
+def _load_opp_stats_if_needed():
+    """
+    Lazy-load opponent defensive stats and compute league averages.
+    Used only for per-game opponent difficulty scaling.
+    """
+    global OPP_STATS_DF, OPP_LEAGUE_MEANS
+
+    if OPP_STATS_DF is not None:
+        return
+
+    df = clean_columns(pd.read_csv(BASE_DIR / "Opponent Stats Per Game.csv"))
+    # Make sure we have an abbreviation column to match e.g. "TOR", "WAS"
+    if "abbreviation" in df.columns:
+        df["abbreviation"] = df["abbreviation"].str.upper()
+    OPP_STATS_DF = df
+
+    # Pre-compute league averages for the stats we care about
+    for col in ["opp_pts_per_game", "opp_ast_per_game", "opp_trb_per_game"]:
+        if col in df.columns:
+            OPP_LEAGUE_MEANS[col] = df[col].mean()
+        else:
+            OPP_LEAGUE_MEANS[col] = 0.0
+
+
+def get_opponent_scalers(opponent_abbrev: Optional[str]):
+    """
+    Return scaling factors (pts_scale, ast_scale, trb_scale) based on how
+    tough the opponent is defensively vs league average.
+
+    - If opponent is very strong defensively -> factors < 1
+    - If opponent is weak defensively      -> factors > 1
+    - Clamped between 0.85 and 1.15 to avoid crazy extremes.
+    """
+    if not opponent_abbrev:
+        return 1.0, 1.0, 1.0
+
+    _load_opp_stats_if_needed()
+    opp_code = opponent_abbrev.upper()
+
+    df = OPP_STATS_DF
+    row = df[df["abbreviation"] == opp_code]
+
+    if row.empty:
+        return 1.0, 1.0, 1.0
+
+    row = row.iloc[0]
+
+    def _scale(col: str, clamp_low: float = 0.85, clamp_high: float = 1.15) -> float:
+        league_mean = OPP_LEAGUE_MEANS.get(col, 0.0)
+        val = float(row[col]) if col in row and not pd.isna(row[col]) else 0.0
+
+        if league_mean <= 0 or val <= 0:
+            return 1.0
+
+        # If this team allows fewer points than average, factor < 1.
+        raw = league_mean / val
+        return max(clamp_low, min(clamp_high, raw))
+
+    pts_scale = _scale("opp_pts_per_game")
+    ast_scale = _scale("opp_ast_per_game")
+    trb_scale = _scale("opp_trb_per_game")
+
+    return pts_scale, ast_scale, trb_scale
+
 
 # =====================================================
-# LOADING + MERGING (FINAL VERSION WITH OPPONENT STATS)
+# LOADING + MERGING
 # =====================================================
 
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -118,13 +212,12 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
     return per_game, pbp, teams, opp
 
 
-
 def merge_all() -> pd.DataFrame:
     """
     Build the master dataset:
       - Per Game stats
       - Position shares (from Play By Play)
-      - Opponent defensive stats (team-based)
+      - Opponent defensive stats (team-based, season aggregates)
     """
     per_game, pbp, teams, opp = load_data()
 
@@ -136,7 +229,7 @@ def merge_all() -> pd.DataFrame:
         suffixes=("", "_pbp"),
     )
 
-    # Merge opponent defensive stats
+    # Merge opponent defensive stats (team-level)
     df = df.merge(
         opp,
         on=["team", "season"],
@@ -151,7 +244,6 @@ def merge_all() -> pd.DataFrame:
     return df
 
 
-
 # =====================================================
 # INJURED PLAYER + MINUTES REDISTRIBUTION
 # =====================================================
@@ -164,6 +256,7 @@ def get_injured_row(master_df: pd.DataFrame, injured_name: str) -> pd.Series:
     subset = master_df[master_df["player_clean"] == name_clean]
 
     if subset.empty:
+        # Try fuzzy match on last name to give useful suggestions
         last = injured_name.split()[-1]
         suggestions = master_df[
             master_df["player"].str.contains(last, case=False, na=False)
@@ -204,12 +297,10 @@ def redistribute_minutes(master_df: pd.DataFrame, injured_name: str) -> pd.DataF
 
     # Share of minutes based on position % if available
     if pos_col and pos_col in teammates.columns:
-        # percentages like 40, 60 etc
         teammates["minute_share"] = teammates[pos_col].fillna(0) / 100.0
         total_share = teammates["minute_share"].sum()
 
         if total_share <= 0:
-            # fallback to equal share
             teammates["minute_share"] = 1.0 / len(teammates)
         else:
             teammates["minute_share"] = teammates["minute_share"] / total_share
@@ -346,6 +437,7 @@ def add_over_under_probabilities(
 
     return df
 
+
 def apply_usage_bump(out: pd.DataFrame) -> pd.DataFrame:
     """
     Apply a usage bump to players when a starter is out.
@@ -375,15 +467,18 @@ def apply_usage_bump(out: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+
 def predict_replacement_stats(
     master_df: pd.DataFrame,
     models: Dict[str, RandomForestRegressor],
     injured_name: str,
+    opponent_abbrev: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     1. Redistribute minutes from the injured player.
     2. Predict per-minute stats for each teammate.
     3. Scale by predicted_new_minutes to get full-game stats.
+    4. Apply usage bump AND opponent difficulty scaling.
     """
     base = redistribute_minutes(master_df, injured_name)
 
@@ -407,12 +502,23 @@ def predict_replacement_stats(
         model = models[k]
         per_min_pred = model.predict(X_feat)  # stat per minute
         out[f"final_{k}"] = per_min_pred * base["predicted_new_minutes"]
-        # Apply usage bump after raw model predictions
+
+    # Apply usage bump after raw model predictions
     out = apply_usage_bump(out)
+
+    # Apply opponent difficulty scaling
+    pts_scale, ast_scale, trb_scale = get_opponent_scalers(opponent_abbrev)
+    if "final_pts" in out.columns:
+        out["final_pts"] *= pts_scale
+    if "final_ast" in out.columns:
+        out["final_ast"] *= ast_scale
+    if "final_trb" in out.columns:
+        out["final_trb"] *= trb_scale
 
     # Sort by minutes (most important replacements first)
     out = out.sort_values("predicted_new_minutes", ascending=False).reset_index(drop=True)
     return out
+
 
 # =====================================================
 # PUBLIC ENTRY POINT (USED BY DISCORD BOT)
@@ -431,8 +537,12 @@ def _init_if_needed():
 
     df = merge_all()
 
-    # 🔥 FILTER TO ONLY RECENT SEASONS (2025 + 2026)
-    recent_df = df[df["season"].isin([2025, 2026])]
+    # 🔥 FILTER TO ONLY RECENT SEASONS (2024 + 2025 + 2026)
+    if "season" in df.columns:
+        recent_df = df[df["season"].isin([2024, 2025, 2026])]
+    else:
+        recent_df = df
+
     print("Training on seasons:", sorted(recent_df["season"].unique()))
     print("Recent dataset size:", recent_df.shape)
 
@@ -441,10 +551,9 @@ def _init_if_needed():
     MODELS, ERROR_STD = train_ml_models(MASTER_DF)
 
 
-
 def run_prediction(
     injured_name: str,
-    opponent_abbrev: Optional[str] = None,  # kept for compatibility, not used in option 1
+    opponent_abbrev: Optional[str] = None,
     lines: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """
@@ -453,9 +562,9 @@ def run_prediction(
     Parameters
     ----------
     injured_name : str
-        Name of the injured player ("Dennis Schroder").
+        Name of the injured player ("Dennis Schroder", "Luka Doncic", etc).
     opponent_abbrev : str | None
-        Kept for later (option 2). Ignored in this simple version.
+        Opponent team code, e.g. "WAS", "ATL". Used for difficulty scaling.
     lines : dict | None
         Optional. Example: {"pts": 14.5, "ast": 4.5, "trb": 3.5}
 
@@ -468,7 +577,7 @@ def run_prediction(
     """
     _init_if_needed()
 
-    df_base = predict_replacement_stats(MASTER_DF, MODELS, injured_name)
+    df_base = predict_replacement_stats(MASTER_DF, MODELS, injured_name, opponent_abbrev)
 
     if df_base.empty:
         return df_base
@@ -488,7 +597,7 @@ def run_prediction(
 if __name__ == "__main__":
     # Example quick test
     test_lines = {"pts": 14.5, "ast": 4.5, "trb": 3.5}
-    df_test = run_prediction("Dennis Schroder", opponent_abbrev=None, lines=test_lines)
+    df_test = run_prediction("Dennis Schroder", opponent_abbrev="ATL", lines=test_lines)
     print(
         df_test[
             [

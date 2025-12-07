@@ -2,232 +2,153 @@ import os
 import re
 import discord
 from discord.ext import commands
-from datetime import datetime
 from model import run_prediction
+import traceback
 
-
-BOT_TOKEN = "MTQ0MzUxMDA4OTA1NDE2MzAxNQ.GPhltp.zOTYZu37j9LwQsps4zczkvP9kjW4DQ30nXGnU8"
+TOKEN = "MTQ0MzUxMDA4OTA1NDE2MzAxNQ.GPhltp.zOTYZu37j9LwQsps4zczkvP9kjW4DQ30nXGnU8"   # ← Replace with your real token
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-# ==================================================
-# DAILY TRACKED INJURY + LINEUP DATA
-# ==================================================
-TODAY_OUT = []
-TODAY_Q = []
-TODAY_PROB = []
-TODAY_LINEUPS = []
-TODAY_DATE = None
+# -----------------------------------------------------
+# TEAM MAP FOR DETECTING OPPONENTS
+# -----------------------------------------------------
+
+TEAM_MAP = {
+    "ATL": "ATL", "HAWKS": "ATL",
+    "BOS": "BOS", "CELTICS": "BOS",
+    "BKN": "BKN", "NETS": "BKN",
+    "CHA": "CHA", "HORNETS": "CHA",
+    "CHI": "CHI", "BULLS": "CHI",
+    "CLE": "CLE", "CAVS": "CLE",
+    "DAL": "DAL", "MAVS": "DAL",
+    "DEN": "DEN", "NUGGETS": "DEN",
+    "DET": "DET", "PISTONS": "DET",
+    "GSW": "GSW", "WARRIORS": "GSW",
+    "HOU": "HOU", "ROCKETS": "HOU",
+    "IND": "IND", "PACERS": "IND",
+    "LAC": "LAC", "CLIPPERS": "LAC",
+    "LAL": "LAL", "LAKERS": "LAL",
+    "MEM": "MEM", "GRIZZLIES": "MEM",
+    "MIA": "MIA", "HEAT": "MIA",
+    "MIL": "MIL", "BUCKS": "MIL",
+    "MIN": "MIN", "WOLVES": "MIN",
+    "NOP": "NOP", "PELICANS": "NOP",
+    "NYK": "NYK", "KNICKS": "NYK",
+    "OKC": "OKC", "THUNDER": "OKC",
+    "ORL": "ORL", "MAGIC": "ORL",
+    "PHI": "PHI", "SIXERS": "PHI",
+    "PHX": "PHX", "SUNS": "PHX",
+    "POR": "POR", "BLAZERS": "POR",
+    "SAC": "SAC", "KINGS": "SAC",
+    "SAS": "SAS", "SPURS": "SAS",
+    "TOR": "TOR", "RAPTORS": "TOR",
+    "UTA": "UTA", "JAZZ": "UTA",
+    "WAS": "WAS", "WIZARDS": "WAS",
+}
 
 
-def reset_daily_data():
-    """Resets stored injury info once per day."""
-    global TODAY_DATE, TODAY_OUT, TODAY_Q, TODAY_PROB, TODAY_LINEUPS
-    today = datetime.now().date()
+# -----------------------------------------------------
+# CLEAN PLAYER NAME (Fixes Luka Dončić issue)
+# -----------------------------------------------------
 
-    if TODAY_DATE != today:
-        TODAY_DATE = today
-        TODAY_OUT.clear()
-        TODAY_Q.clear()
-        TODAY_PROB.clear()
-        TODAY_LINEUPS.clear()
-
-
-# ==================================================
-# INJURY + LINEUP PATTERNS (Underdog messages)
-# ==================================================
-PAT_OUT = [
-    "ruled out",
-    "won't return",
-    "will not return",
-    "will not play",
-    "is out",
-]
-
-PAT_Q = [
-    "questionable",
-]
-
-PAT_PROB = [
-    "probable",
-]
-
-PAT_LINEUP = [
-    "lineup alert",
-    "will start",
-    "starting",
-    "starts",
-]
+def clean_player_for_model(name: str) -> str:
+    name = (
+        name.lower()
+        .replace("č", "c")
+        .replace("ć", "c")
+        .replace("ö", "o")
+        .replace("ó", "o")
+        .replace(".", "")
+        .replace(",", "")
+        .strip()
+    )
+    return " ".join(w.capitalize() for w in name.split())
 
 
-# ==================================================
-# PLAYER NAME DETECTOR (simple)
-# ==================================================
-PLAYER_REGEX = re.compile(r"([A-Z][a-z]+\s[A-Z][a-z]+)")
+# -----------------------------------------------------
+# EXTRACT PLAYER + OPPONENT FROM MESSAGE
+# -----------------------------------------------------
+
+def extract_info(msg: str):
+    text = msg.lower().strip()
+
+    # opponent = after "vs ___"
+    opp_match = re.search(r"vs\s+([A-Za-z]+)", text)
+    opponent = None
+    if opp_match:
+        raw = opp_match.group(1).upper()
+        opponent = TEAM_MAP.get(raw, raw[:3])
+
+    # remove "is out vs TEAM" → leaves ONLY player name
+    cleaned = re.sub(r"is out.*", "", text)
+    cleaned = cleaned.replace("injury", "").strip()
+
+    player_guess = clean_player_for_model(cleaned)
+    return player_guess, opponent
 
 
-def extract_player_name(msg: str):
-    m = PLAYER_REGEX.search(msg)
-    if not m:
-        return None
-    return m.group(1)
+# -----------------------------------------------------
+# MAIN EVENT HANDLER
+# -----------------------------------------------------
 
-
-# ==================================================
-# AUTO MESSAGE HANDLER (injuries, tracking, etc)
-# ==================================================
 @bot.event
 async def on_message(message):
-
-    if message.author == bot.user:
+    if message.author.bot:
         return
 
-    reset_daily_data()
+    content = message.content.lower()
 
-    text = message.content.lower()
+    # Detect message: "*player* is out vs *TEAM*"
+    if "is out" in content and "vs" in content:
+        player, opponent = extract_info(content)
 
-    # -----------------------------
-    # 1) STORE today's injury updates
-    # -----------------------------
-    player = extract_player_name(message.content)
-
-    if player:
-
-        # OUT
-        if any(p in text for p in PAT_OUT):
-            TODAY_OUT.append(message.content)
-
-        # QUESTIONABLE
-        elif any(p in text for p in PAT_Q):
-            TODAY_Q.append(message.content)
-
-        # PROBABLE
-        elif any(p in text for p in PAT_PROB):
-            TODAY_PROB.append(message.content)
-
-        # LINEUP ALERTS
-        elif any(p in text for p in PAT_LINEUP):
-            TODAY_LINEUPS.append(message.content)
-
-
-    # -----------------------------
-    # 2) ORIGINAL AUTO INJURY PREDICTIONS
-    # -----------------------------
-    INJURY_PATTERN = re.compile(
-        r"([A-Z][a-z]+\s[A-Z][a-z]+).*(is out|out|ruled out|will not play).*vs\s+([A-Z]{2,3})",
-        re.IGNORECASE,
-    )
-
-    match = INJURY_PATTERN.search(message.content)
-
-    if match:
-        player_name = match.group(1).strip()
-        opponent = match.group(3).upper()
-
-        await message.channel.send(
-            f"🏥 **Injury detected:** {player_name} is OUT vs **{opponent}**\n"
-            f"🧠 Running prediction model..."
+        embed = discord.Embed(
+            title=f"🚨 Injury Detected",
+            description=f"**{player}** is OUT vs **{opponent}**",
+            color=0xFF4C4C
         )
+        embed.add_field(name="Model", value="Running prediction model…", inline=False)
+        await message.channel.send(embed=embed)
 
         try:
-            df = run_prediction(player_name, opponent)
+            df = run_prediction(player, opponent_abbrev=opponent)
 
             if df.empty:
-                await message.channel.send("⚠️ No replacement players found.")
+                await message.channel.send("❌ No prediction data found.")
                 return
 
-            msg = f"📊 **Predicted Impact if {player_name} is OUT vs {opponent}:**\n\n"
+            # Build results embed
+            result = discord.Embed(
+                title=f"📊 Predicted Impact if {player} is OUT vs {opponent}",
+                color=0x5865F2
+            )
 
-            for i in range(min(3, len(df))):
-                row = df.iloc[i]
-                msg += (
-                    f"**{i+1}) {row['player']}**\n"
-                    f"• Minutes: {row['predicted_new_minutes']:.1f}\n"
-                    f"• Points: {row['final_pts']:.1f} ({row.get('prob_pts_over',0)*100:.0f}% over line)\n"
-                    f"• Assists: {row['final_ast']:.1f} ({row.get('prob_ast_over',0)*100:.0f}% over line)\n"
-                    f"• Rebounds: {row['final_trb']:.1f} ({row.get('prob_trb_over',0)*100:.0f}% over line)\n\n"
+            for i, row in df.head(3).iterrows():
+                result.add_field(
+                    name=f"{i+1}) {row['player']}",
+                    value=(
+                        f"• **Minutes:** {row['predicted_new_minutes']:.1f}\n"
+                        f"• **Points:** {row['final_pts']:.1f}\n"
+                        f"• **Assists:** {row['final_ast']:.1f}\n"
+                        f"• **Rebounds:** {row['final_trb']:.1f}"
+                    ),
+                    inline=False
                 )
 
-            await message.channel.send(msg)
+            await message.channel.send(embed=result)
 
         except Exception as e:
-            await message.channel.send(f"❌ Error: `{e}`")
+            await message.channel.send(f"❌ Error:\n```\n{e}\n```")
+            print(traceback.format_exc())
 
     await bot.process_commands(message)
 
 
-# ==================================================
-# COMMAND: !updates — list ALL injuries today
-# ==================================================
-@bot.command()
-async def updates(ctx):
+# -----------------------------------------------------
+# RUN BOT
+# -----------------------------------------------------
 
-    reset_daily_data()
-
-    out_msg = "**🟥 OUT:**\n" + (
-        "\n".join(f"• {x}" for x in TODAY_OUT)
-        if TODAY_OUT else "No OUT updates today."
-    )
-
-    q_msg = "\n\n**🟧 QUESTIONABLE:**\n" + (
-        "\n".join(f"• {x}" for x in TODAY_Q)
-        if TODAY_Q else "No QUESTIONABLE updates today."
-    )
-
-    p_msg = "\n\n**🟨 PROBABLE:**\n" + (
-        "\n".join(f"• {x}" for x in TODAY_PROB)
-        if TODAY_PROB else "No PROBABLE updates today."
-    )
-
-    l_msg = "\n\n**🟦 LINEUP ALERTS:**\n" + (
-        "\n".join(f"• {x}" for x in TODAY_LINEUPS)
-        if TODAY_LINEUPS else "No LINEUP alerts today."
-    )
-
-    await ctx.send(out_msg + q_msg + p_msg + l_msg)
-
-
-# ==================================================
-# COMMAND: Manual Prediction (unchanged)
-# ==================================================
-@bot.command()
-async def predictplayer(ctx, first: str, last: str, opponent: str):
-    player_name = f"{first} {last}"
-    opponent = opponent.upper()
-
-    try:
-        df = run_prediction(player_name, opponent)
-
-        if df.empty:
-            await ctx.send(f"⚠️ No data found for {player_name}.")
-            return
-
-        row = df.iloc[0]
-
-        msg = (
-            f"📊 **Prediction for {player_name} vs {opponent}:**\n"
-            f"• Minutes: {row['predicted_new_minutes']:.1f}\n"
-            f"• Points: {row['final_pts']:.1f}\n"
-            f"• Assists: {row['final_ast']:.1f}\n"
-            f"• Rebounds: {row['final_trb']:.1f}\n"
-        )
-
-        await ctx.send(msg)
-
-    except Exception as e:
-        await ctx.send(f"❌ Error: `{e}`")
-
-
-# ==================================================
-# BOT READY
-# ==================================================
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-
-
-bot.run(BOT_TOKEN)
-
+bot.run(TOKEN)
