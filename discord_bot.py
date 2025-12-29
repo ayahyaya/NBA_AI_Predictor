@@ -5,17 +5,15 @@ from discord.ext import commands
 from model import run_prediction
 import traceback
 
-TOKEN = "MTQ0MzUxMDA4OTA1NDE2MzAxNQ.GPhltp.zOTYZu37j9LwQsps4zczkvP9kjW4DQ30nXGnU8"   # ← Replace with your real token
+TOKEN = "MTQ0MzUxMDA4OTA1NDE2MzAxNQ.GPhltp.zOTYZu37j9LwQsps4zczkvP9kjW4DQ30nXGnU8"
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
 # -----------------------------------------------------
-# TEAM MAP FOR DETECTING OPPONENTS
+# TEAM MAP
 # -----------------------------------------------------
-
 TEAM_MAP = {
     "ATL": "ATL", "HAWKS": "ATL",
     "BOS": "BOS", "CELTICS": "BOS",
@@ -49,12 +47,10 @@ TEAM_MAP = {
     "WAS": "WAS", "WIZARDS": "WAS",
 }
 
-
 # -----------------------------------------------------
-# CLEAN PLAYER NAME (Fixes Luka Dončić issue)
+# NAME CLEANING
 # -----------------------------------------------------
-
-def clean_player_for_model(name: str) -> str:
+def clean_player(name: str) -> str:
     name = (
         name.lower()
         .replace("č", "c")
@@ -67,33 +63,31 @@ def clean_player_for_model(name: str) -> str:
     )
     return " ".join(w.capitalize() for w in name.split())
 
-
 # -----------------------------------------------------
-# EXTRACT PLAYER + OPPONENT FROM MESSAGE
+# PARSE MULTIPLE INJURIES
 # -----------------------------------------------------
+def extract_players_and_opponent(msg: str):
+    text = msg.lower()
 
-def extract_info(msg: str):
-    text = msg.lower().strip()
-
-    # opponent = after "vs ___"
-    opp_match = re.search(r"vs\s+([A-Za-z]+)", text)
+    # opponent
+    opp_match = re.search(r"vs\s+([a-zA-Z]+)", text)
     opponent = None
     if opp_match:
         raw = opp_match.group(1).upper()
         opponent = TEAM_MAP.get(raw, raw[:3])
 
-    # remove "is out vs TEAM" → leaves ONLY player name
-    cleaned = re.sub(r"is out.*", "", text)
-    cleaned = cleaned.replace("injury", "").strip()
+    # players
+    players_part = re.sub(r"is out.*", "", text)
+    players_part = re.sub(r"\b(out|injury|will not play)\b", "", players_part)
 
-    player_guess = clean_player_for_model(cleaned)
-    return player_guess, opponent
+    raw_players = re.split(r",| and | & ", players_part)
+    players = [clean_player(p) for p in raw_players if len(p.strip()) > 2]
 
+    return players, opponent
 
 # -----------------------------------------------------
-# MAIN EVENT HANDLER
+# MAIN LISTENER
 # -----------------------------------------------------
-
 @bot.event
 async def on_message(message):
     if message.author.bot:
@@ -101,39 +95,76 @@ async def on_message(message):
 
     content = message.content.lower()
 
-    # Detect message: "*player* is out vs *TEAM*"
     if "is out" in content and "vs" in content:
-        player, opponent = extract_info(content)
+        players, opponent = extract_players_and_opponent(content)
 
-        embed = discord.Embed(
-            title=f"🚨 Injury Detected",
-            description=f"**{player}** is OUT vs **{opponent}**",
+        if not players or not opponent:
+            return
+
+        # 🔒 Build a set of OUT players (cleaned)
+        out_players_set = set(players)
+
+        header = discord.Embed(
+            title="🚨 Injury Update Detected",
+            description=f"**OUT:** {', '.join(players)} vs **{opponent}**",
             color=0xFF4C4C
         )
-        embed.add_field(name="Model", value="Running prediction model…", inline=False)
-        await message.channel.send(embed=embed)
+        await message.channel.send(embed=header)
+
+        combined = {}
 
         try:
-            df = run_prediction(player, opponent_abbrev=opponent)
+            for injured in players:
+                df = run_prediction(injured, opponent_abbrev=opponent)
+                if df.empty:
+                    continue
 
-            if df.empty:
-                await message.channel.send("❌ No prediction data found.")
+                for _, row in df.iterrows():
+                    name = row["player"]
+
+                    # ❌ HARD FILTER: never show injured players
+                    if name in out_players_set:
+                        continue
+
+                    if name not in combined:
+                        combined[name] = {
+                            "minutes": row["predicted_new_minutes"],
+                            "pts": row["final_pts"],
+                            "ast": row["final_ast"],
+                            "reb": row["final_trb"],
+                        }
+                    else:
+                        combined[name]["minutes"] = max(
+                            combined[name]["minutes"],
+                            row["predicted_new_minutes"]
+                        )
+                        combined[name]["pts"] += row["final_pts"] * 0.5
+                        combined[name]["ast"] += row["final_ast"] * 0.5
+                        combined[name]["reb"] += row["final_trb"] * 0.5
+
+            if not combined:
+                await message.channel.send("❌ No valid replacement projections found.")
                 return
 
-            # Build results embed
+            ranked = sorted(
+                combined.items(),
+                key=lambda x: x[1]["minutes"],
+                reverse=True
+            )[:5]
+
             result = discord.Embed(
-                title=f"📊 Predicted Impact if {player} is OUT vs {opponent}",
+                title="📊 Combined Replacement Impact",
                 color=0x5865F2
             )
 
-            for i, row in df.head(3).iterrows():
+            for i, (name, d) in enumerate(ranked, 1):
                 result.add_field(
-                    name=f"{i+1}) {row['player']}",
+                    name=f"{i}) {name}",
                     value=(
-                        f"• **Minutes:** {row['predicted_new_minutes']:.1f}\n"
-                        f"• **Points:** {row['final_pts']:.1f}\n"
-                        f"• **Assists:** {row['final_ast']:.1f}\n"
-                        f"• **Rebounds:** {row['final_trb']:.1f}"
+                        f"• **Minutes:** {d['minutes']:.1f}\n"
+                        f"• **Points:** {d['pts']:.1f}\n"
+                        f"• **Assists:** {d['ast']:.1f}\n"
+                        f"• **Rebounds:** {d['reb']:.1f}"
                     ),
                     inline=False
                 )
@@ -146,9 +177,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-
 # -----------------------------------------------------
-# RUN BOT
+# RUN
 # -----------------------------------------------------
-
 bot.run(TOKEN)

@@ -612,3 +612,156 @@ if __name__ == "__main__":
             ]
         ].head(5)
     )
+from typing import List
+
+def get_injured_rows(master_df: pd.DataFrame, injured_names: List[str]) -> pd.DataFrame:
+    rows = []
+    for name in injured_names:
+        try:
+            r = get_injured_row(master_df, name)
+            rows.append(r)
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def redistribute_minutes_multi(master_df: pd.DataFrame, injured_names: List[str]) -> pd.DataFrame:
+    """
+    Remove minutes from multiple injured players (same team + season)
+    and redistribute total freed minutes to remaining teammates.
+
+    Assumption: injured players are on the SAME TEAM + SAME SEASON (current year).
+    If they’re not, we handle them separately at the Discord level.
+    """
+    injured_df = get_injured_rows(master_df, injured_names)
+    if injured_df.empty:
+        raise ValueError("No injured players found in dataset.")
+
+    # Use most recent season among injured players
+    injured_df = injured_df.sort_values("season", ascending=False)
+    season = int(injured_df.iloc[0]["season"])
+    team = injured_df.iloc[0]["team"]
+
+    injured_df = injured_df[(injured_df["team"] == team) & (injured_df["season"] == season)]
+    if injured_df.empty:
+        raise ValueError("Injured players are not on same team/season.")
+
+    # Total minutes freed
+    freed_total = float(injured_df["mp_per_game"].sum())
+
+    # Remaining teammates
+    injured_clean = set(injured_df["player_clean"].tolist())
+    teammates = master_df[
+        (master_df["team"] == team)
+        & (master_df["season"] == season)
+        & (~master_df["player_clean"].isin(injured_clean))
+    ].copy()
+
+    if teammates.empty:
+        raise ValueError("No teammates found after removing injured players.")
+
+    # --- weighted redistribution by position mix of injured players ---
+    # Build a combined position share profile for the injuries
+    pos_cols = [c for c in POS_TO_COL.values() if c in teammates.columns]
+    if pos_cols:
+        injured_pos_profile = {}
+        for pc in pos_cols:
+            # approximate: take average of injured players position percents
+            injured_pos_profile[pc] = float(injured_df.get(pc, pd.Series([0])).fillna(0).mean())
+
+        # If profile is all zeros, fallback to even share
+        if sum(injured_pos_profile.values()) <= 0:
+            teammates["minute_share"] = 1.0 / len(teammates)
+        else:
+            # teammate score = dot(teammate_pos%, injured_profile%)
+            score = 0
+            for pc in pos_cols:
+                score += (teammates[pc].fillna(0) / 100.0) * (injured_pos_profile[pc] / 100.0)
+            teammates["minute_share"] = score
+
+            total_share = teammates["minute_share"].sum()
+            if total_share <= 0:
+                teammates["minute_share"] = 1.0 / len(teammates)
+            else:
+                teammates["minute_share"] /= total_share
+    else:
+        teammates["minute_share"] = 1.0 / len(teammates)
+
+    teammates["predicted_new_minutes"] = teammates["mp_per_game"] + freed_total * teammates["minute_share"]
+
+    # cap minutes
+    if "predicted_new_minutes" in teammates.columns:
+        teammates["predicted_new_minutes"] = teammates["predicted_new_minutes"].clip(upper=MAX_PREDICTED_MIN)
+
+    keep_cols = list(
+        dict.fromkeys(
+            ["player", "player_id", "team", "season", "pos", "mp_per_game", "predicted_new_minutes"]
+            + ML_FEATURE_COLS
+            + [f"{k}_per_game" for k in STAT_KEYS]
+        )
+    )
+    existing_cols = [c for c in keep_cols if c in teammates.columns]
+    return teammates[existing_cols].reset_index(drop=True)
+
+
+def predict_replacement_stats_multi(
+    master_df: pd.DataFrame,
+    models: Dict[str, RandomForestRegressor],
+    injured_names: List[str],
+    opponent_abbrev: Optional[str] = None,
+) -> pd.DataFrame:
+    base = redistribute_minutes_multi(master_df, injured_names)
+    if base.empty:
+        return base
+
+    X_new = base.copy()
+    for col in ML_FEATURE_COLS:
+        if col not in X_new.columns:
+            X_new[col] = 0.0
+
+    X_new["mp_per_game"] = base["predicted_new_minutes"]
+    X_feat = X_new[ML_FEATURE_COLS]
+
+    out = base[["player", "team", "season", "predicted_new_minutes"]].copy()
+
+    for k in STAT_KEYS:
+        model = models[k]
+        per_min_pred = model.predict(X_feat)
+        model_full = per_min_pred * base["predicted_new_minutes"]
+
+        per_game_col = f"{k}_per_game"
+        if per_game_col in base.columns and "mp_per_game" in base.columns:
+            safe_mp = base["mp_per_game"].replace(0, np.nan)
+            base_per_min = (base[per_game_col] / safe_mp).fillna(0.0)
+            base_full = base_per_min * base["predicted_new_minutes"]
+            out[f"final_{k}"] = PRIOR_BLEND_WEIGHT * base_full + (1.0 - PRIOR_BLEND_WEIGHT) * model_full
+        else:
+            out[f"final_{k}"] = model_full
+
+    out = apply_usage_bump(out)
+
+    pts_scale, ast_scale, trb_scale = get_opponent_scalers(opponent_abbrev)
+    out["final_pts"] *= pts_scale
+    out["final_ast"] *= ast_scale
+    out["final_trb"] *= trb_scale
+
+    return out.sort_values("predicted_new_minutes", ascending=False).reset_index(drop=True)
+
+
+def run_prediction_multi(
+    injured_names: List[str],
+    opponent_abbrev: Optional[str] = None,
+    lines: Optional[Dict[str, float]] = None,
+) -> pd.DataFrame:
+    _init_if_needed()
+    df_base = predict_replacement_stats_multi(MASTER_DF, MODELS, injured_names, opponent_abbrev)
+
+    if df_base.empty:
+        return df_base
+
+    if lines:
+        return add_over_under_probabilities(df_base, lines, ERROR_STD)
+
+    return df_base
