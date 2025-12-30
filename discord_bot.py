@@ -5,7 +5,8 @@ from discord.ext import commands
 from model import run_prediction
 import traceback
 
-TOKEN = "MTQ0MzUxMDA4OTA1NDE2MzAxNQ.GPhltp.zOTYZu37j9LwQsps4zczkvP9kjW4DQ30nXGnU8"
+TOKEN = os.getenv("DISCORD_TOKEN")
+
 
 intents = discord.Intents.default()
 intents.message_content = True
